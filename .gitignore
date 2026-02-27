@@ -1,0 +1,12 @@
+# Build output
+build/
+
+# Archives
+*.7z
+*.zip
+*.tar.gz
+
+# IDE / OS
+.vscode/
+.DS_Store
+Thumbs.db

@@ -5,6 +5,21 @@
  */
 
 / {
+	/* SOF debug GPIO: toggle on each timer IRQ (20us after SOF).
+	 * Connect logic analyzer probe here to verify SOF->timer chain.
+	 * Change <&gpio1 0 ...> to any free header pin as needed.
+	 */
+	sof_dbg_gpios {
+		compatible = "gpio-leds";
+		sof_dbg: sof_dbg_0 {
+			gpios = <&gpio1 0 GPIO_ACTIVE_HIGH>;
+		};
+	};
+
+	aliases {
+		sof-dbg = &sof_dbg;
+	};
+
 	hid_dev_0: hid_dev_0 {
 		compatible = "zephyr,hid-device";
 		label = "HID0";

@@ -12,6 +12,7 @@
 #include <hal/nrf_gpiote.h>
 #include <helpers/nrfx_gppi.h>
 #include <nrfx_timer.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(app_usbd, LOG_LEVEL_INF);
 
@@ -24,6 +25,9 @@ LOG_MODULE_REGISTER(app_usbd, LOG_LEVEL_INF);
 
 /** @brief TIMER instance used in the example. */
 static nrfx_timer_t timer_inst = NRFX_TIMER_INSTANCE(NRF_TIMER_INST_GET(TIMER_INST_IDX));
+
+/* Debug GPIO: toggles each time the timer fires (20us after USB SOF). */
+static const struct gpio_dt_spec sof_dbg_gpio = GPIO_DT_SPEC_GET(DT_ALIAS(sof_dbg), gpios);
 
 
 static int get_report_cb(const struct device *dev,
@@ -53,8 +57,9 @@ static void timer_handler(nrf_timer_event_t event_type, void * p_context)
 {
     if(event_type == NRF_TIMER_EVENT_COMPARE0)
     {
-        char * p_msg = p_context;
-        LOG_INF("Timer finished. Context passed to the handler: >%s<", p_msg);
+        gpio_pin_toggle_dt(&sof_dbg_gpio);
+        // char * p_msg = p_context;
+        // LOG_INF("Timer finished. Context passed to the handler: >%s<", p_msg);
     }
 }
 
@@ -158,6 +163,9 @@ int timer_init(void)
     status = nrfx_timer_init(&timer_inst, &config, timer_handler);
     NRFX_ASSERT(status == 0);
     nrfx_timer_clear(&timer_inst);
+
+    /* Configure SOF debug GPIO as output, initially low. */
+    gpio_pin_configure_dt(&sof_dbg_gpio, GPIO_OUTPUT_LOW);
     /* Creating variable desired_ticks to store the output of nrfx_timer_ms_to_ticks function */
     // uint32_t desired_ticks = nrfx_timer_ms_to_ticks(&timer_inst, TIME_TO_WAIT_MS);
     // LOG_INF("Time to wait: %lu ms", TIME_TO_WAIT_MS);	
@@ -168,91 +176,78 @@ int timer_init(void)
      * trigger an interrupt if internal counter register is equal to desired_ticks.
      */
     nrfx_timer_extended_compare(&timer_inst, NRF_TIMER_CC_CHANNEL0, desired_ticks,
-                                NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK, true);
+                                NRF_TIMER_SHORT_COMPARE0_CLEAR_MASK | NRF_TIMER_SHORT_COMPARE0_STOP_MASK, true);
 
     // nrfx_timer_enable(&timer_inst);	
     // LOG_INF("Timer status: %s", nrfx_timer_is_enabled(&timer_inst) ? "enabled" : "disabled");
 	return 0;
 }
 
-int dppi_usb_sof_timer_setup(void)
+int dppi_usb_sof_timer_gpiote_setup(void)
 {
-	uint32_t usbhs_start_task;
-	uint32_t usbhs_domain_id;
+	uint32_t usbhs_start_task = (uint32_t)&NRF_USBHS->TASKS_START;
+	uint32_t usbhs_domain_id = nrfx_gppi_domain_id_get(usbhs_start_task);
 
-	usbhs_start_task = (uint32_t)&NRF_USBHS->TASKS_START;
-	usbhs_domain_id = nrfx_gppi_domain_id_get(usbhs_start_task);
-
-	uint32_t timer_compare_task_addr = nrf_timer_task_address_get(timer_inst.p_reg, NRF_TIMER_TASK_START);
-	uint32_t timer_domain_id = nrfx_gppi_domain_id_get(timer_compare_task_addr);
+	/* --- Connection 1: USBHS SOF → Timer START --- */
+	uint32_t timer_task_addr = nrf_timer_task_address_get(timer_inst.p_reg, NRF_TIMER_TASK_START);
+	uint32_t timer_domain_id = nrfx_gppi_domain_id_get(timer_task_addr);
 
 	int err;
-	nrfx_gppi_handle_t gppi_handle;
+	nrfx_gppi_handle_t gppi_handle_timer;
 
-	err = nrfx_gppi_domain_conn_alloc(usbhs_domain_id, timer_domain_id, &gppi_handle);
-
-	if (!err) {
-		uint32_t usbhs_dppi_ch = nrfx_gppi_domain_channel_get(gppi_handle, usbhs_domain_id);
-
-		NRF_USBHS->PUBLISH_SOF = (usbhs_dppi_ch << USBHS_PUBLISH_SOF_CHIDX_Pos) |
-								 (USBHS_PUBLISH_SOF_EN_Enabled << USBHS_PUBLISH_SOF_EN_Pos);
+	err = nrfx_gppi_domain_conn_alloc(usbhs_domain_id, timer_domain_id, &gppi_handle_timer);
+	if (err) {
+		LOG_ERR("Timer conn alloc failed: %d", err);
 	}
 
-	if (!err) {
-		err = nrfx_gppi_ep_attach(timer_compare_task_addr, gppi_handle);
+	/* Retrieve the allocated DPPI channel in the USBHS domain and configure PUBLISH_SOF. */
+	uint32_t usbhs_dppi_ch = nrfx_gppi_domain_channel_get(gppi_handle_timer, usbhs_domain_id);
+	NRF_USBHS->PUBLISH_SOF = (usbhs_dppi_ch << USBHS_PUBLISH_SOF_CHIDX_Pos) |
+							 (USBHS_PUBLISH_SOF_EN_Enabled << USBHS_PUBLISH_SOF_EN_Pos);
+
+	err = nrfx_gppi_ep_attach(timer_task_addr, gppi_handle_timer);
+	if (err) {
+		LOG_ERR("Timer ep attach failed: %d", err);
 	}
 
-	if (!err) {
-		nrfx_timer_enable(&timer_inst);
+	/* --- Connection 2: USBHS SOF → GPIOTE30 OUT (reuse the same source DPPI channel) --- */
+	uint32_t gpiote_task_addr = nrf_gpiote_task_address_get(NRF_GPIOTE30, NRF_GPIOTE_TASK_OUT_0);
+	uint32_t gpiote_domain_id = nrfx_gppi_domain_id_get(gpiote_task_addr);
 
-		nrfx_gppi_conn_enable(gppi_handle);
-	} else {
-		k_oops();
+	nrfx_gppi_handle_t gppi_handle_gpiote;
+
+	/*
+	 * Pass the already-allocated USBHS DPPI channel as p_resource so that
+	 * nrfx_gppi_ext_conn_alloc reuses it instead of allocating a new one.
+	 * Both PPIB bridges will then be driven by the same PUBLISH_SOF channel,
+	 * triggering both tasks simultaneously on every SOF event.
+	 */
+	nrfx_gppi_resource_t usbhs_resource = {
+		.domain_id = (uint16_t)usbhs_domain_id,
+		.channel   = (uint8_t)usbhs_dppi_ch,
+	};
+	err = nrfx_gppi_ext_conn_alloc(usbhs_domain_id, gpiote_domain_id,
+				       &gppi_handle_gpiote, &usbhs_resource);
+	if (err) {
+		LOG_ERR("GPIOTE conn alloc failed: %d", err);
 	}
-}
 
+	nrf_gpiote_task_configure(NRF_GPIOTE30, 0, 3,
+				  NRF_GPIOTE_POLARITY_TOGGLE,
+				  NRF_GPIOTE_INITIAL_VALUE_LOW);
 
-int dppi_usb_sof_gpiote_setup(void)
-{
-    uint32_t usbhs_start_task;
-    uint32_t usbhs_domain_id;
+	err = nrfx_gppi_ep_attach(gpiote_task_addr, gppi_handle_gpiote);
+	if (err) {
+		LOG_ERR("GPIOTE ep attach failed: %d", err);
+	}
 
-    usbhs_start_task = (uint32_t)&NRF_USBHS->TASKS_START;
-    usbhs_domain_id = nrfx_gppi_domain_id_get(usbhs_start_task);
+	nrf_gpiote_task_enable(NRF_GPIOTE30, 0);
 
-    uint32_t gpiote_task_addr = nrf_gpiote_task_address_get(NRF_GPIOTE30, NRF_GPIOTE_TASK_OUT_0);
-    uint32_t gpiote_domain_id = nrfx_gppi_domain_id_get(gpiote_task_addr);
+	nrfx_timer_enable(&timer_inst);
+	nrfx_gppi_conn_enable(gppi_handle_timer);
+	nrfx_gppi_conn_enable(gppi_handle_gpiote);
 
-    int err;
-    nrfx_gppi_handle_t gppi_handle;
-
-    err = nrfx_gppi_domain_conn_alloc(usbhs_domain_id, gpiote_domain_id, &gppi_handle);
-
-    if (!err) {
-        uint32_t usbhs_dppi_ch = nrfx_gppi_domain_channel_get(gppi_handle, usbhs_domain_id);
-
-        NRF_USBHS->PUBLISH_SOF = (usbhs_dppi_ch << USBHS_PUBLISH_SOF_CHIDX_Pos) |
-                                 (USBHS_PUBLISH_SOF_EN_Enabled << USBHS_PUBLISH_SOF_EN_Pos);
-    }
-
-    if (!err) {
-        nrf_gpiote_task_configure(NRF_GPIOTE30,
-        0,
-        3,
-        NRF_GPIOTE_POLARITY_TOGGLE,
-        NRF_GPIOTE_INITIAL_VALUE_LOW);
-
-        err = nrfx_gppi_ep_attach(gpiote_task_addr, gppi_handle);
-    }
-
-    if (!err) {
-        nrf_gpiote_task_enable(NRF_GPIOTE30, 0);
-
-        nrfx_gppi_conn_enable(gppi_handle);
-    } else {
-        k_oops();
-    }
-     
+	return 0;
 }
 int app_usbd_enable(void)
 {
@@ -272,8 +267,7 @@ int app_usbd_enable(void)
 	}
 
 	if (!err) {
-		// dppi_usb_sof_gpiote_setup();
-		dppi_usb_sof_timer_setup();
+		dppi_usb_sof_timer_gpiote_setup();
 	}
 
 	return err;
